@@ -22,7 +22,7 @@ jobs:
       - name: Build wheel and sdist
         run: python -m build
         shell: bash
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pandera-artifact
           path: ./dist
