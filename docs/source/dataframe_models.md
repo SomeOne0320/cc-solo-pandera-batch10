@@ -888,6 +888,34 @@ df = pd.DataFrame({2020: [99], "a": [101]})
 print(Schema.validate(df))
 ```
 
+### Alternative input headers: `aliases`
+
+While `alias` *renames* the canonical column, `aliases` keeps the canonical
+name and only declares extra headers accepted from the input. This is useful
+when the same rules must validate files whose legacy headers differ:
+
+```{code-cell} python
+import pandas as pd
+import pandera.pandas as pa
+
+
+class FinanceReport(pa.DataFrameModel):
+    # canonical column "amount"; "cost"/"expense" are accepted input headers
+    amount: pa.typing.Series[float] = pa.Field(aliases=["cost", "expense"])
+
+
+print(FinanceReport.validate(pd.DataFrame({"cost": [1.0, 2.0]})))
+```
+
+The field — and every check, parser and column order constraint — keeps using
+the canonical name `amount`; the legacy headers are normalized away before
+validation and never appear in the validated dataframe. When several sources
+of one field are present simultaneously, they must hold identical dtypes and
+row-wise content (equal missing values included), otherwise a conflict error
+is raised rather than one column being picked silently. The full conflict
+rules, the distinction from `alias`, and the `DataFrameSchema` form are
+documented under {ref}`column-aliases`.
+
 ## Manipulating DataFrame Models post-definition
 
 One caveat of using inheritance to build schemas on top of each other is that there

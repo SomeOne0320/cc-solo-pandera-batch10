@@ -5,7 +5,7 @@ import itertools
 import traceback
 import warnings
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 import pandas as pd
 from pydantic import BaseModel
@@ -35,6 +35,21 @@ from pandera.errors import (
 from pandera.validation_depth import validate_scope, validation_type
 
 T = TypeVar("T")
+
+
+class ColumnAliasPlan(NamedTuple):
+    """Result of planning :class:`Column` alias resolution.
+
+    :param rename: source header labels to rename to their canonical name.
+    :param drop: consumed alias headers (content-equal duplicates of the
+        surviving source) that strict mode must not treat as extra columns.
+    :param errors: all detected source conflicts; when non-empty, ``rename``
+        and ``drop`` are empty and the input must not be modified.
+    """
+
+    rename: dict[Any, Any]
+    drop: list[Any]
+    errors: list[SchemaError]
 
 
 class DataFrameSchemaBackend(PandasSchemaBackend):
@@ -90,6 +105,14 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
         check_obj = self.preprocess(check_obj, inplace=inplace)
         if hasattr(check_obj, "pandera"):
             check_obj = check_obj.pandera.add_schema(schema)
+
+        # Normalize alternative input headers (Column ``aliases``) to the
+        # canonical column names. All conflicts are planned against the input
+        # headers before any label is renamed, so the input is never mutated
+        # while the source mapping is ambiguous -- even with inplace=True.
+        check_obj = self.normalize_column_aliases(
+            check_obj, schema, error_handler, lazy
+        )
 
         # run custom parsers
         check_obj = self.run_parsers(schema, check_obj)
@@ -412,6 +435,263 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                     SchemaWarning,
                     stacklevel=2,
                 )
+
+    ###########
+    # Aliases #
+    ###########
+
+    def normalize_column_aliases(
+        self,
+        check_obj: pd.DataFrame,
+        schema,
+        error_handler: ErrorHandler,
+        lazy: bool,
+    ) -> pd.DataFrame:
+        """Rename configured alternative input headers to canonical names.
+
+        Planning -- collecting every ambiguous source and conflicting content
+        case -- is completed entirely against the input headers before the
+        frame is modified, so the caller's data stays untouched whenever the
+        mapping cannot be resolved (including ``inplace=True`` callers, since
+        ``preprocess`` already copied the frame when ``inplace=False``).
+        """
+        plan = self._plan_column_aliases(check_obj, schema)
+        errors = plan.errors
+        if errors:
+            schema_errors = SchemaErrors(
+                schema=schema,
+                schema_errors=errors,
+                data=check_obj,
+            )
+            if lazy:
+                error_handler.collect_errors(schema_errors.schema_errors)
+            else:
+                raise schema_errors
+            return check_obj
+
+        rename_plan = plan.rename
+        drop_labels = plan.drop
+        if not rename_plan and not drop_labels:
+            return check_obj
+
+        # Reassign labels by position so duplicate labels elsewhere in the
+        # frame cannot be selected unintentionally by a label-based operation.
+        check_obj = check_obj.copy()
+        drop_positions = {
+            pos
+            for pos, label in enumerate(check_obj.columns)
+            if label in drop_labels
+        }
+        keep_positions = [
+            pos
+            for pos in range(check_obj.shape[1])
+            if pos not in drop_positions
+        ]
+        check_obj = check_obj.iloc[:, keep_positions]
+        check_obj.columns = pd.Index(
+            [rename_plan.get(label, label) for label in check_obj.columns]
+        )
+        return check_obj
+
+    def _plan_column_aliases(
+        self,
+        check_obj: pd.DataFrame,
+        schema,
+    ) -> "ColumnAliasPlan":
+        """Build the normalization plan for columns declaring ``aliases``.
+
+        Returns a :class:`ColumnAliasPlan` carrying the rename map
+        (``source label -> canonical name``), the labels to drop (consumed
+        alias headers whose content matches the surviving source), and every
+        detected conflict: non-unique sources (duplicate input headers or two
+        fields claiming the same header) and content/dtype conflicts between
+        several sources of one field. No conflict means every claimed source
+        resolves to exactly one field and, when several sources map to one
+        field, they hold identical row-wise content (equal missing values
+        treated as equal content).
+        """
+        # Label -> positions: every header appearing more than once makes any
+        # alias claim on that label non-unique.
+        label_positions: dict[Any, list[int]] = {}
+        for pos, label in enumerate(check_obj.columns):
+            label_positions.setdefault(label, []).append(pos)
+
+        # Which field claims each input label (canonical names included).
+        claimers: dict[Any, list[str]] = {}
+        # Per-field labels that are actually present in the input.
+        field_sources: dict[str, list[Any]] = {}
+        canonical_names = set(schema.columns)
+        for field_name, col_schema in schema.columns.items():
+            aliases = getattr(col_schema, "aliases", ())
+            if (
+                col_schema.regex
+                or not aliases
+                or not isinstance(field_name, str)
+            ):
+                continue
+            present = [field_name] if field_name in label_positions else []
+            for alias in aliases:
+                if alias in label_positions:
+                    present.append(alias)
+                    claimers.setdefault(alias, []).append(field_name)
+                    # Another field's canonical name is itself a claim on the
+                    # header, so an alias pointing at it is a contention.
+                    if alias in canonical_names and alias != field_name:
+                        claimers.setdefault(alias, []).append(alias)
+            if present:
+                field_sources[field_name] = present
+
+        errors: list[SchemaError] = []
+        errors.extend(
+            self._alias_claim_conflicts(
+                schema, check_obj, label_positions, claimers, field_sources
+            )
+        )
+        errors.extend(
+            self._alias_content_conflicts(
+                schema, check_obj, field_sources, label_positions
+            )
+        )
+        if errors:
+            return ColumnAliasPlan(rename={}, drop=[], errors=errors)
+
+        rename: dict[Any, Any] = {}
+        drop: list[Any] = []
+        for field_name, sources in field_sources.items():
+            if field_name in sources:
+                # The canonical column is present: it is the surviving
+                # representative and the matching alias headers are consumed.
+                drop.extend(label for label in sources if label != field_name)
+            else:
+                # No canonical header: the first declared alias takes its
+                # place; the remaining, content-equal aliases are consumed.
+                rename[sources[0]] = field_name
+                drop.extend(sources[1:])
+        return ColumnAliasPlan(rename=rename, drop=drop, errors=[])
+
+    def _alias_claim_conflicts(
+        self,
+        schema,
+        check_obj: pd.DataFrame,
+        label_positions: dict[Any, list[int]],
+        claimers: dict[Any, list[str]],
+        field_sources: dict[str, list[Any]],
+    ) -> list[SchemaError]:
+        """Conflicts about *which* field an input header belongs to."""
+        errors: list[SchemaError] = []
+
+        # 1. Two fields configured aliases that resolve to the same header.
+        for label, fields in claimers.items():
+            unique_fields = list(dict.fromkeys(fields))
+            if len(unique_fields) > 1:
+                errors.append(
+                    SchemaError(
+                        schema=schema,
+                        data=check_obj,
+                        message=(
+                            f"column '{label}' is claimed as an alias source "
+                            f"by multiple schema fields: {unique_fields}. "
+                            "Declare the header on at most one field or rename "
+                            "the input column."
+                        ),
+                        failure_cases=label,
+                        check="column_alias_source_unique",
+                        reason_code=(
+                            SchemaErrorReason.ALIAS_SOURCE_NOT_UNIQUE
+                        ),
+                    )
+                )
+
+        # 2. A needed header is duplicated in the input, so the source column
+        #    cannot be identified unambiguously.
+        for field_name, sources in field_sources.items():
+            ambiguous = [
+                label for label in sources if len(label_positions[label]) > 1
+            ]
+            if ambiguous:
+                errors.append(
+                    SchemaError(
+                        schema=schema,
+                        data=check_obj,
+                        message=(
+                            f"alias source(s) {ambiguous} for field "
+                            f"'{field_name}' appear multiple times in the "
+                            "dataframe headers, so the source column is not "
+                            "unique. Rename or drop the duplicate headers."
+                        ),
+                        failure_cases=ambiguous,
+                        check="column_alias_source_unique",
+                        reason_code=(
+                            SchemaErrorReason.ALIAS_SOURCE_NOT_UNIQUE
+                        ),
+                        column_name=field_name,
+                    )
+                )
+        return errors
+
+    def _alias_content_conflicts(
+        self,
+        schema,
+        check_obj: pd.DataFrame,
+        field_sources: dict[str, list[Any]],
+        label_positions: dict[Any, list[int]],
+    ) -> list[SchemaError]:
+        """Conflicts about *different content* in several sources of a field."""
+        errors: list[SchemaError] = []
+        for field_name, sources in field_sources.items():
+            if len(sources) < 2:
+                continue
+            # Duplicate labels already reported as non-unique claims; content
+            # comparison requires one position per label.
+            if any(len(label_positions[label]) > 1 for label in sources):
+                continue
+
+            reference_label = sources[0]
+            reference = check_obj[reference_label]
+            for label in sources[1:]:
+                candidate = check_obj[label]
+                if self._alias_series_conflict(reference, candidate):
+                    errors.append(
+                        SchemaError(
+                            schema=schema,
+                            data=check_obj,
+                            message=(
+                                f"alias sources {sources} of field "
+                                f"'{field_name}' are present simultaneously "
+                                "but do not hold identical data: columns "
+                                f"'{reference_label}' and '{label}' differ "
+                                "in dtype or row-wise values. Make the "
+                                "sources identical, keep only one header, or "
+                                "rename one of the input columns."
+                            ),
+                            failure_cases=[reference_label, label],
+                            check="column_alias_source_content",
+                            reason_code=(
+                                SchemaErrorReason.ALIAS_SOURCE_CONFLICT
+                            ),
+                            column_name=field_name,
+                        )
+                    )
+        return errors
+
+    @staticmethod
+    def _alias_series_conflict(left: pd.Series, right: pd.Series) -> bool:
+        """True when two candidate sources cannot be merged into one column.
+
+        The raw pandas dtypes must match and every row must compare equal,
+        with equal missing values treated as equal content.
+        """
+        if left.dtype != right.dtype:
+            return True
+        if len(left) != len(right):
+            return True
+        missing_left = left.isna()
+        if not missing_left.equals(right.isna()):
+            return True
+        observed = left[~missing_left]
+        if observed.empty:
+            return False
+        return not bool(observed.equals(right[~missing_left]))
 
     def collect_column_info(
         self,

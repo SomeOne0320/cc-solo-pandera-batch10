@@ -52,6 +52,7 @@ COLUMN_TEMPLATE = """
     regex={regex},
     description={description},
     title={title},
+    aliases={aliases},
 )
 """
 
@@ -471,6 +472,7 @@ def to_script(
             regex=properties["regex"],
             description=(None if description is None else f'"{description}"'),
             title=(None if title is None else f'"{title}"'),
+            aliases=properties.get("aliases") or [],
         )
         columns[colname] = column_code.strip()
 

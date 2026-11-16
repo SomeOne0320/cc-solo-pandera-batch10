@@ -52,6 +52,7 @@ class BaseFieldInfo:
         "default",
         "metadata",
         "on_missing",
+        "aliases",
     )
 
     def __init__(
@@ -72,6 +73,7 @@ class BaseFieldInfo:
         default: Any | None = None,
         metadata: dict | None = None,
         on_missing: str | None = None,
+        aliases: Iterable[str] | None = None,
     ) -> None:
         self.checks = to_checklist(checks)
         self.parses = to_parserlist(parses)
@@ -91,6 +93,7 @@ class BaseFieldInfo:
         self.default = default
         self.metadata = metadata
         self.on_missing = on_missing
+        self.aliases = tuple(aliases) if aliases is not None else None
 
     @property
     def name(self) -> str:

@@ -120,6 +120,11 @@ def get_dataframe_schema_statistics(dataframe_schema):
                     if column.report_duplicates != "all"
                     else {}
                 ),
+                **(
+                    {"aliases": list(column.aliases)}
+                    if getattr(column, "aliases", ())
+                    else {}
+                ),
                 "drop_invalid_rows": column.drop_invalid_rows,
             }
             for col_name, column in dataframe_schema.columns.items()

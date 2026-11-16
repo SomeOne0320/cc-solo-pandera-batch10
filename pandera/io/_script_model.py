@@ -193,6 +193,9 @@ def _format_field_from_column(
             continue
         parts.append(f"{attr}={val!r}")
 
+    if getattr(column, "aliases", ()):
+        parts.append(f"aliases={list(column.aliases)!r}")
+
     if not parts:
         return ""
     inner = ", ".join(parts)

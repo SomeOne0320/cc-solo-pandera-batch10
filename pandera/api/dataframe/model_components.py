@@ -63,9 +63,13 @@ class FieldInfo(BaseFieldInfo):
         required = self.required if self.required_explicit else required
         # ``on_missing`` is only forwarded when explicitly set so that
         # backends whose ``Column`` does not (yet) support it are unaffected.
-        extra = (
+        extra: dict[str, Any] = (
             {} if self.on_missing is None else {"on_missing": self.on_missing}
         )
+        # ``aliases`` is pandas-only; it is forwarded only when configured so
+        # backends whose ``Column`` does not accept it keep their old behavior.
+        if self.aliases is not None:
+            extra = {**extra, "aliases": self.aliases}
         return self._get_schema_properties(
             dtype,
             nullable=nullable,
@@ -122,6 +126,7 @@ class FieldInfo(BaseFieldInfo):
             "description": self.description,
             "metadata": self.metadata,
             "on_missing": self.on_missing,
+            "aliases": self.aliases,
         }
 
 
@@ -205,6 +210,7 @@ def Field(
     default: Any | None = None,
     metadata: dict[str, Any] | None = None,
     on_missing: str | None = None,
+    aliases: Iterable[str] | None = None,
     **kwargs: Any,
 ) -> Any:
     """Column or index field specification of a DataFrameModel.
@@ -271,6 +277,12 @@ def Field(
         ``"warn"`` a :class:`~pandera.errors.SchemaWarning` is emitted. This
         overrides the schema-wide ``on_missing_columns`` config option. Only
         supported by the pandas backend for now.
+    :param aliases: alternative input header names for this field's column.
+        Unlike ``alias``, which renames the canonical column itself,
+        ``aliases`` only declares additional headers accepted at validation
+        time: the column is still exposed under its canonical name (the
+        attribute name, or ``alias`` when given). Only supported by the
+        pandas backend and only for non-index, non-regex fields.
     :param kwargs: Specify custom checks that have been registered with the
         :class:`~pandera.extensions.register_check_method` decorator.
     """
@@ -320,6 +332,7 @@ def Field(
         dtype_kwargs=dtype_kwargs,
         metadata=metadata,
         on_missing=on_missing,
+        aliases=aliases,
     )
 
 

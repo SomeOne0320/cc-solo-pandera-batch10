@@ -35,6 +35,7 @@ COLUMN_DEFAULTS: dict[str, Any] = {
     "default": None,
     "drop_invalid_rows": False,
     "name": None,
+    "aliases": (),
 }
 
 # MultiIndex (api.pandas.components.MultiIndex) options, serialized under

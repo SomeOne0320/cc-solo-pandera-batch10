@@ -189,6 +189,8 @@ class SchemaErrorReason(Enum):
     ADD_MISSING_COLUMN_NO_DEFAULT = "add_missing_column_no_default"
     INVALID_COLUMN_NAME = "invalid_column_name"
     MISMATCH_INDEX = "mismatch_index"
+    ALIAS_SOURCE_NOT_UNIQUE = "alias_source_not_unique"
+    ALIAS_SOURCE_CONFLICT = "alias_source_conflict"
 
 
 class SchemaErrors(ReducedPickleExceptionBase):

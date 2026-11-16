@@ -219,6 +219,12 @@ class DataFrameModel(_DataFrameModel[pd.DataFrame, DataFrameSchema]):
                     raise SchemaInitError(
                         f"Index '{field_name}' cannot be Optional."
                     )
+                if getattr(field, "aliases", None):
+                    raise SchemaInitError(
+                        f"Index field '{field_name}' cannot declare aliases: "
+                        "alternative input headers are only supported for "
+                        "dataframe columns, not indexes."
+                    )
 
                 if check_name is False or (
                     # default single index

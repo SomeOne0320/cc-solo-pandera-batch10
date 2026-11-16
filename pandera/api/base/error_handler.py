@@ -37,6 +37,8 @@ ERROR_CATEGORY_MAP = {
     SchemaErrorReason.INVALID_COLUMN_NAME: ErrorCategory.SCHEMA,
     SchemaErrorReason.MISMATCH_INDEX: ErrorCategory.SCHEMA,
     SchemaErrorReason.PARSER_ERROR: ErrorCategory.DATA,
+    SchemaErrorReason.ALIAS_SOURCE_NOT_UNIQUE: ErrorCategory.SCHEMA,
+    SchemaErrorReason.ALIAS_SOURCE_CONFLICT: ErrorCategory.SCHEMA,
 }
 
 

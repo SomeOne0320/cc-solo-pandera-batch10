@@ -39,6 +39,7 @@ class Column(ArraySchema[pd.DataFrame]):
         metadata: dict | None = None,
         drop_invalid_rows: bool = False,
         on_missing: str | None = None,
+        aliases: Iterable[str] | None = None,
     ) -> None:
         """Create column validator object.
 
@@ -73,6 +74,14 @@ class Column(ArraySchema[pd.DataFrame]):
             when the column is missing. This overrides the schema-level
             ``on_missing_columns`` option for this column. It has no effect on
             required columns, whose absence is always an error.
+        :param aliases: alternative input header names for this column. When
+            the canonical ``name`` is absent from the validated dataframe, a
+            column with one of these labels is normalized to the canonical
+            name before the rest of the validation pipeline runs. Aliases are
+            only supported on non-regex, string-named columns; indexes and
+            regex column patterns do not accept alias sources. See the
+            :ref:`column aliases <column-aliases>` guide for the conflict
+            rules applied when several candidate sources are present.
 
         :raises SchemaInitError: if impossible to build schema from parameters
 
@@ -122,10 +131,12 @@ class Column(ArraySchema[pd.DataFrame]):
                 "on_missing must be one of "
                 f"{(None, *ON_MISSING_ACTIONS)}, got {on_missing!r}."
             )
+        aliases = _validate_aliases(name, regex, aliases)
         self.required = required
         self.name = name
         self.regex = regex
         self.on_missing = on_missing
+        self.aliases = aliases
 
     @property
     def _allow_groupby(self) -> bool:
@@ -168,6 +179,7 @@ class Column(ArraySchema[pd.DataFrame]):
             "default": self.default,
             "metadata": self.metadata,
             "on_missing": self.on_missing,
+            "aliases": self.aliases,
         }
 
     def set_name(self, name: str):
@@ -610,3 +622,55 @@ class ParsedColumn(Column):
 def is_valid_multiindex_key(x: tuple[Any, ...]) -> bool:
     """Check that a multi-index tuple key has all string elements"""
     return isinstance(x, tuple) and all(isinstance(i, str) for i in x)
+
+
+def _validate_aliases(
+    name: Any,
+    regex: bool,
+    aliases: Iterable[str] | None,
+) -> tuple[str, ...]:
+    """Validate and normalize the ``aliases`` option of a :class:`Column`.
+
+    Aliases are alternative input headers for an ordinary, string-named,
+    non-regex column. They are not supported on regex column patterns or
+    non-string (e.g. MultiIndex tuple) names.
+    """
+    if aliases is None:
+        return ()
+
+    if isinstance(aliases, str):
+        raise errors.SchemaInitError(
+            "Column aliases must be an iterable of strings, got a single "
+            f"string {aliases!r}. Wrap it in a list or tuple."
+        )
+
+    alias_list = list(aliases)
+    if not all(isinstance(alias, str) for alias in alias_list):
+        raise errors.SchemaInitError(
+            "Column aliases must be strings, got "
+            f"{[a for a in alias_list if not isinstance(a, str)]!r}."
+        )
+
+    if not alias_list:
+        return ()
+
+    if name is not None and not isinstance(name, str):
+        raise errors.SchemaInitError(
+            "Column aliases are only supported for string column names, "
+            f"got name {name!r}."
+        )
+    if regex:
+        raise errors.SchemaInitError(
+            f"Column aliases are not supported for regex column "
+            f"'{name}'. Regex column patterns already match multiple "
+            "input headers."
+        )
+
+    if any(alias == name for alias in alias_list):
+        raise errors.SchemaInitError(
+            f"Column aliases for '{name}' must not repeat the canonical "
+            f"column name, got {alias_list!r}."
+        )
+
+    # de-duplicate while preserving declaration order
+    return tuple(dict.fromkeys(alias_list))

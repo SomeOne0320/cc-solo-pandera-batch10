@@ -245,6 +245,91 @@ columns, whose absence is always an error. With
 {ref}`class-based schemas <dataframe-models>`, use `Field(on_missing="warn")`
 on a field or `on_missing_columns = "warn"` in the model's `Config`.
 
+(column-aliases)=
+
+### Alternative input headers (`aliases`)
+
+Sometimes the same validation rules must cover files produced by different
+upstream systems, where one column appears under several legacy headers.
+Instead of renaming the column in the schema itself — which would also change
+the canonical name every downstream check, parser and result uses — declare
+the extra input headers with `aliases`:
+
+```{code-cell} python
+import pandas as pd
+import pandera.pandas as pa
+
+
+schema = pa.DataFrameSchema({
+    "amount": pa.Column(float, aliases=["cost", "expense"]),
+})
+
+# all three input headers validate as the canonical "amount" column
+for header in ("amount", "cost", "expense"):
+    validated = schema.validate(pd.DataFrame({header: [1.0, 2.0]}))
+    print(validated.columns.tolist())
+```
+
+The alias headers are normalized to the canonical column name *before* the
+rest of the validation pipeline runs, so table- and column-level parsing,
+dtype coercion, order constraints, checks and strict mode all use the
+canonical name. Consumed alias headers are not reported as extra columns by
+`strict=True` / `strict="filter"`. The default non-in-place call leaves the
+input data, row order and index untouched.
+
+With a {ref}`DataFrameModel <dataframe-models>`, the same option is available
+on `Field`:
+
+```{code-cell} python
+class FinanceReport(pa.DataFrameModel):
+    amount: float = pa.Field(aliases=["cost", "expense"])
+
+
+FinanceReport.validate(pd.DataFrame({"cost": [1.0]}))
+```
+
+Note that `Field(alias=...)` and `Field(aliases=...)` answer different
+questions:
+
+- `alias` **is** the canonical, public column name. The attribute
+  `amount` above would be exposed under the `alias` name if one were given.
+- `aliases` only lists additional headers accepted *at validation time*. The
+  column keeps its canonical name (the attribute name, or `alias` when both
+  are given), and alias headers never appear in the validated dataframe.
+
+#### How conflicting sources are resolved
+
+Planning happens entirely against the input headers, before the dataframe is
+modified — even with `validate(..., inplace=True)`. The input is never
+partially rewritten when a conflict is found.
+
+1. **No source at all.** If neither the canonical name nor any alias is
+   present, the normal required / optional / `add_missing_columns` rules
+   apply unchanged.
+2. **Exactly one source.** The matching header is renamed to the canonical
+   name (when it is an alias) or left in place (when it already is the
+   canonical name).
+3. **Several sources of one field.** When the canonical column and one or
+   more aliases, or several aliases, are present at the same time, they are
+   merged into one canonical column only when their raw pandas dtypes match
+   *and* every row holds the same content. Equal missing values (e.g. `NaN`
+   in the same rows) count as equal content. Otherwise a
+   `SchemaErrorReason.ALIAS_SOURCE_CONFLICT` error reports the conflicting
+   source labels instead of silently picking one column.
+4. **Non-unique sources.** A header that two fields claim as an alias, an
+   alias pointing at another field's canonical name, or the same header
+   appearing more than once in the input raises
+   `SchemaErrorReason.ALIAS_SOURCE_NOT_UNIQUE`.
+
+Content-equal extra sources are consumed (dropped) so the validated frame
+contains exactly one column per field. With `lazy=True`, every conflict is
+collected before validation aborts.
+
+`aliases` accepts string headers only. Indexes, regex column patterns and
+non-string (e.g. MultiIndex tuple) names do not support alias sources, and
+the option is only implemented for the local pandas backend; schemas without
+`aliases` behave exactly as before.
+
 (column-validation-1)=
 
 ### Stand-alone Column Validation
