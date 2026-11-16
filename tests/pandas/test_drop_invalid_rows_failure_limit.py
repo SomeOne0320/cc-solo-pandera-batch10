@@ -237,3 +237,314 @@ def test_drop_invalid_rows_failure_limit_respects_subsample(n_failure_cases):
     validated = schema.validate(frame, head=2, lazy=True)
 
     pd.testing.assert_frame_equal(validated, frame.iloc[2:])
+
+
+# ---------------------------------------------------------------------------
+# Duplicate index labels: rows are removed by position, not by label.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, 2, None])
+def test_drop_invalid_rows_duplicate_index_removes_only_failing_rows(
+    n_failure_cases,
+):
+    """A repeated label does not make a passing row collateral damage."""
+    frame = pd.DataFrame(
+        {"x": [1, -2, 3, -4]}, index=pd.Index([0, 0, 1, 1], name="row")
+    )
+    schema = pa.DataFrameSchema(
+        {"x": pa.Column(int, pa.Check.gt(0, n_failure_cases=n_failure_cases))},
+        drop_invalid_rows=True,
+    )
+
+    validated = schema.validate(frame, lazy=True)
+
+    pd.testing.assert_frame_equal(validated, frame.iloc[[0, 2]])
+    assert validated.index.names == ["row"]
+    assert validated.index.equals(pd.Index([0, 1], name="row"))
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, None])
+def test_drop_invalid_rows_duplicate_index_multiple_checks_union(
+    n_failure_cases,
+):
+    """Overlapping failures across checks are combined before removal."""
+    frame = pd.DataFrame(
+        {"x": [-1, 2, -3, 4], "y": [1, -2, -3, 4]},
+        index=pd.Index(["a", "a", "b", "b"]),
+    )
+    schema = pa.DataFrameSchema(
+        {
+            "x": pa.Column(
+                int, pa.Check.gt(0, n_failure_cases=n_failure_cases)
+            ),
+            "y": pa.Column(
+                int, pa.Check.gt(0, n_failure_cases=n_failure_cases)
+            ),
+        },
+        drop_invalid_rows=True,
+    )
+
+    validated = schema.validate(frame, lazy=True)
+
+    pd.testing.assert_frame_equal(validated, frame.iloc[[3]])
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, None])
+def test_drop_invalid_rows_duplicate_multiindex_combinations(n_failure_cases):
+    """Repeated MultiIndex tuples are treated like any other repeated label."""
+    index = pd.MultiIndex.from_tuples(
+        [("a", 1), ("a", 1), ("b", 2), ("b", 2)], names=["group", "row"]
+    )
+    frame = pd.DataFrame({"x": [1, -2, 3, -4]}, index=index)
+    schema = pa.DataFrameSchema(
+        {"x": pa.Column(int, pa.Check.gt(0, n_failure_cases=n_failure_cases))},
+        drop_invalid_rows=True,
+    )
+
+    validated = schema.validate(frame, lazy=True)
+
+    pd.testing.assert_frame_equal(validated, frame.iloc[[0, 2]])
+    assert validated.index.names == ["group", "row"]
+
+
+@pytest.mark.parametrize(
+    "schema, expected_selector",
+    [
+        # dtype violations
+        (
+            pa.DataFrameSchema({"x": pa.Column(int)}),
+            [0, 2],
+        ),
+        # nullability violations
+        (
+            pa.DataFrameSchema({"x": pa.Column(float, nullable=False)}),
+            [0, 2],
+        ),
+    ],
+)
+def test_drop_invalid_rows_duplicate_index_core_checks(
+    schema, expected_selector
+):
+    """Core-check failures also map back to exact rows, not labels."""
+    frame = pd.DataFrame(
+        {"x": [1, "bad", 2, "bad"]}, index=pd.Index([0, 0, 1, 1])
+    )
+    schema = schema.update_column("x", dtype=schema.columns["x"].dtype)
+    schema.drop_invalid_rows = True
+
+    validated = schema.validate(frame, lazy=True)
+
+    pd.testing.assert_frame_equal(validated, frame.iloc[expected_selector])
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, None])
+def test_drop_invalid_rows_duplicate_index_ignore_na(n_failure_cases):
+    """Null-skipping rows keep their position among repeated labels."""
+    frame = pd.DataFrame(
+        {"x": [-1.0, None, -2.0, 3.0]}, index=pd.Index([0, 0, 1, 1])
+    )
+    schema = pa.DataFrameSchema(
+        {
+            "x": pa.Column(
+                float,
+                pa.Check(
+                    lambda obj: obj > 0,
+                    ignore_na=True,
+                    n_failure_cases=n_failure_cases,
+                ),
+                nullable=True,
+            )
+        },
+        drop_invalid_rows=True,
+    )
+
+    validated = schema.validate(frame, lazy=True)
+
+    pd.testing.assert_frame_equal(validated, frame.iloc[[1, 3]])
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, None])
+def test_drop_invalid_rows_duplicate_index_head_subsample(n_failure_cases):
+    """Only checked rows are dropped; same-label unchecked rows are kept."""
+    frame = pd.DataFrame({"x": [-1, -2, -3, 4]}, index=pd.Index([0, 0, 0, 0]))
+    schema = pa.DataFrameSchema(
+        {"x": pa.Column(int, pa.Check.gt(0, n_failure_cases=n_failure_cases))},
+        drop_invalid_rows=True,
+    )
+
+    validated = schema.validate(frame, head=2, lazy=True)
+
+    pd.testing.assert_frame_equal(validated, frame.iloc[2:])
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, None])
+def test_drop_invalid_rows_duplicate_index_nested_column_subsample(
+    n_failure_cases,
+):
+    """A nested column rule drops only the checked subset."""
+    frame = pd.DataFrame({"x": [-1, -2, -3, 4]}, index=pd.Index([0, 0, 0, 0]))
+    schema = pa.DataFrameSchema(
+        {
+            "x": pa.Column(
+                int,
+                pa.Check.gt(0, n_failure_cases=n_failure_cases),
+                drop_invalid_rows=True,
+            )
+        }
+    )
+
+    validated = schema.validate(frame, head=2, lazy=True)
+
+    pd.testing.assert_frame_equal(validated, frame.iloc[2:])
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, None])
+@pytest.mark.parametrize("schema_type", ["series", "column", "dataframe"])
+def test_drop_invalid_rows_duplicate_index_schema_types(
+    n_failure_cases, schema_type
+):
+    """Series, standalone Column, and DataFrame schemas all drop by row."""
+    frame = pd.DataFrame({"x": [1, -2, 3, -4]}, index=pd.Index([0, 0, 1, 1]))
+    check = pa.Check.gt(0, n_failure_cases=n_failure_cases)
+    if schema_type == "series":
+        schema = pa.SeriesSchema(int, check, drop_invalid_rows=True)
+        data = frame["x"]
+    elif schema_type == "column":
+        schema = pa.Column(int, check, name="x", drop_invalid_rows=True)
+        data = frame
+    else:
+        schema = pa.DataFrameSchema(
+            {"x": pa.Column(int, check)}, drop_invalid_rows=True
+        )
+        data = frame
+
+    validated = schema.validate(data, lazy=True)
+
+    expected = (
+        frame["x"].iloc[[0, 2]]
+        if schema_type == "series"
+        else frame.iloc[[0, 2]]
+    )
+    if schema_type == "series":
+        pd.testing.assert_series_equal(validated, expected)
+    else:
+        pd.testing.assert_frame_equal(validated, expected)
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, None])
+def test_drop_invalid_rows_duplicate_index_parser(n_failure_cases):
+    """Parsed values survive and duplicate labels stay distinct."""
+    frame = pd.DataFrame(
+        {
+            "id": [1, 2, 3, 4],
+            "channel": ["Google", "bing", "invalid", "google"],
+        },
+        index=pd.Index([0, 0, 1, 1]),
+    )
+    schema = pa.DataFrameSchema(
+        {
+            "id": pa.Column(int),
+            "channel": pa.Column(
+                str,
+                pa.Check.isin(
+                    ["google", "bing"], n_failure_cases=n_failure_cases
+                ),
+                parsers=pa.Parser(lambda s: s.str.lower()),
+            ),
+        },
+        drop_invalid_rows=True,
+    )
+
+    validated = schema.validate(frame, lazy=True)
+
+    expected = frame.iloc[[0, 1, 3]].copy()
+    expected["channel"] = ["google", "bing", "google"]
+    pd.testing.assert_frame_equal(validated, expected)
+
+
+def test_drop_invalid_rows_duplicate_index_does_not_mutate_input():
+    """The default non-inplace call leaves the caller's frame untouched."""
+    frame = pd.DataFrame({"x": [1, -2, 3, -4]}, index=pd.Index([0, 0, 1, 1]))
+    original = frame.copy(deep=True)
+    schema = pa.DataFrameSchema(
+        {"x": pa.Column(int, pa.Check.gt(0))}, drop_invalid_rows=True
+    )
+
+    schema.validate(frame, lazy=True)
+
+    pd.testing.assert_frame_equal(frame, original)
+
+
+def test_drop_invalid_rows_duplicate_index_failure_report_labels():
+    """Reports keep the user-visible labels, never internal row positions."""
+    frame = pd.DataFrame({"x": [-1, -2, -3]}, index=pd.Index(["a", "a", "b"]))
+    schema = pa.DataFrameSchema(
+        {"x": pa.Column(int, pa.Check.gt(0, n_failure_cases=1))}
+    )
+
+    with pytest.raises(pa.errors.SchemaErrors) as exc_info:
+        schema.validate(frame, lazy=True)
+
+    failure_cases = exc_info.value.failure_cases
+    assert len(failure_cases) == 1
+    assert list(failure_cases["index"]) == ["a"]
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, None])
+def test_drop_invalid_rows_duplicate_index_coercion(n_failure_cases):
+    """Coercion failures drop only the rows that could not be coerced."""
+    frame = pd.DataFrame(
+        {"x": ["1", "bad", "2", "bad"]}, index=pd.Index([0, 0, 1, 1])
+    )
+    schema = pa.DataFrameSchema(
+        {"x": pa.Column(int, coerce=True)}, drop_invalid_rows=True
+    )
+
+    validated = schema.validate(frame, lazy=True)
+
+    # A failed coercion leaves the column uncoerced, so the surviving rows
+    # keep their original values and dtype.
+    expected = frame.iloc[[0, 2]]
+    pd.testing.assert_frame_equal(validated, expected)
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, None])
+def test_drop_invalid_rows_duplicate_index_dataframe_dtype_coercion(
+    n_failure_cases,
+):
+    """Frame-level coercion masks are reduced per row, not per cell."""
+    frame = pd.DataFrame(
+        {
+            "a": ["1", "bad", "2", "bad"],
+            "b": ["3", "4", "5", "bad"],
+        },
+        index=pd.Index([0, 0, 1, 1]),
+    )
+    schema = pa.DataFrameSchema(
+        {"a": pa.Column(), "b": pa.Column()},
+        dtype=int,
+        coerce=True,
+        drop_invalid_rows=True,
+    )
+
+    validated = schema.validate(frame, lazy=True)
+
+    expected = frame.iloc[[0, 2]]
+    pd.testing.assert_frame_equal(validated, expected)
+
+
+def test_drop_invalid_rows_duplicate_index_no_internal_attrs_leaked():
+    """Internal row bookkeeping never shows up in output or error objects."""
+    frame = pd.DataFrame({"x": [-1, -2]}, index=pd.Index([0, 0]))
+    throwing = pa.DataFrameSchema({"x": pa.Column(int, pa.Check.gt(0))})
+    with pytest.raises(pa.errors.SchemaErrors) as exc_info:
+        throwing.validate(frame, lazy=True)
+    assert exc_info.value.failure_cases.attrs == {}
+    assert exc_info.value.data.attrs == {}
+
+    dropping = pa.DataFrameSchema(
+        {"x": pa.Column(int, pa.Check.gt(0))}, drop_invalid_rows=True
+    )
+    validated = dropping.validate(frame, lazy=True)
+    assert validated.attrs == {}

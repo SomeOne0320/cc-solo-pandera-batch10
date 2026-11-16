@@ -7,6 +7,7 @@ import warnings
 from collections.abc import Callable
 from typing import Any, TypeVar
 
+import numpy as np
 import pandas as pd
 from pydantic import BaseModel
 
@@ -17,6 +18,12 @@ from pandera.backends.base import ColumnInfo, CoreCheckResult, CoreParserResult
 from pandera.backends.pandas.base import (
     PandasSchemaBackend,
     _parsed_column_values,
+    attach_failing_ids,
+    ensure_row_ids,
+    get_row_ids,
+    ids_from_mask,
+    strip_row_ids_on_exit,
+    take_rows,
 )
 from pandera.backends.pandas.error_formatters import (
     reshape_failure_cases,
@@ -46,6 +53,7 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
             check_obj = check_obj.copy()
         return check_obj
 
+    @strip_row_ids_on_exit
     def validate(
         self,
         check_obj: pd.DataFrame,
@@ -91,6 +99,10 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
         if hasattr(check_obj, "pandera"):
             check_obj = check_obj.pandera.add_schema(schema)
 
+        # Tag rows with positional ids so that failures can be attributed to
+        # exact rows even when index labels repeat.
+        ensure_row_ids(check_obj)
+
         # run custom parsers
         check_obj = self.run_parsers(schema, check_obj)
 
@@ -115,7 +127,10 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                 error_handler.collect_error(
                     get_error_category(exc.reason_code), exc.reason_code, exc
                 )
+                self._record_parser_failure_ids(check_obj, exc)
             except SchemaErrors as exc:
+                for schema_error in exc.schema_errors:
+                    self._record_parser_failure_ids(check_obj, schema_error)
                 if lazy:
                     error_handler.collect_errors(exc.schema_errors)
                 else:
@@ -166,13 +181,58 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                 )
 
         # Propagate nested Column drop_invalid_rows to the container output
-        # (non-mutating, see _apply_nested_drop_invalid_rows).
+        # (non-mutating, see _apply_nested_drop_invalid_rows). Only rows that
+        # were actually checked are passed along, so head/tail/sample never
+        # drop unchecked rows.
         if any(getattr(c, "drop_invalid_rows", False) for c in components):
             check_obj = self._apply_nested_drop_invalid_rows(
-                check_obj, components, lazy
+                check_obj,
+                components,
+                lazy,
+                head=head,
+                tail=tail,
+                sample=sample,
+                random_state=random_state,
             )
 
         return check_obj
+
+    @staticmethod
+    def _record_parser_failure_ids(check_obj, schema_error):
+        """Record failing row ids for coercion/parser errors.
+
+        These errors are raised outside the per-check flow, so the failure
+        cases only carry reported labels. Resolving them against the parsed
+        object keeps duplicate labels distinct.
+        """
+        schema_error.failure_cases = attach_failing_ids(
+            check_obj,
+            schema_error.failure_cases,
+            schema_error.check_output,
+        )
+
+    @staticmethod
+    def _record_coercion_failure_ids(obj, dtype, schema_error):
+        """Record exact failing ids when coercion fails for ``obj``.
+
+        The failure cases only carry rendered labels, which are ambiguous for
+        duplicated labels, so recompute the coercibility mask.
+        """
+        ids = None
+        if dtype is not None:
+            try:
+                from pandera.engines import utils as engine_utils
+
+                coercible = engine_utils.numpy_pandas_coercible(obj, dtype)
+                ids = ids_from_mask(obj, ~np.asarray(coercible).astype(bool))
+            except Exception:  # pragma: no cover - unexpected dtype handling
+                ids = None
+        schema_error.failure_cases = attach_failing_ids(
+            obj,
+            schema_error.failure_cases,
+            schema_error.check_output,
+            ids,
+        )
 
     def run_checks_and_handle_errors(
         self,
@@ -230,6 +290,14 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                     result.reason_code,
                     error,
                     result.original_exc,
+                )
+                # Record which rows of the (possibly subsampled) object failed
+                # so drop_invalid_rows removes exactly those rows.
+                error.failure_cases = attach_failing_ids(
+                    sample,
+                    error.failure_cases,
+                    result.check_output,
+                    result.failing_ids,
                 )
 
         return error_handler
@@ -302,6 +370,10 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
         check_obj: pd.DataFrame,
         components: list,
         lazy: bool,
+        head: int | None = None,
+        tail: int | None = None,
+        sample: int | None = None,
+        random_state: int | None = None,
     ) -> pd.DataFrame:
         """Non-mutating propagation of nested Column drop_invalid_rows.
 
@@ -314,15 +386,50 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
         for schema_component in components:
             if not getattr(schema_component, "drop_invalid_rows", False):
                 continue
+            checked_obj = self.subsample(
+                check_obj, head, tail, sample, random_state
+            )
             try:
                 result = schema_component.validate(
-                    check_obj, lazy=lazy, inplace=True
+                    checked_obj, lazy=lazy, inplace=True
                 )
             except (SchemaError, SchemaErrors):
                 continue
             if is_table(result):
-                check_obj = result
+                check_obj = self._merge_dropped_rows(
+                    check_obj, checked_obj, result
+                )
         return check_obj
+
+    @staticmethod
+    def _merge_dropped_rows(
+        full_obj: pd.DataFrame,
+        checked_obj: pd.DataFrame,
+        retained: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Drop from ``full_obj`` the checked rows that ``retained`` omits.
+
+        Rows are identified by their positional ids, so duplicate index
+        labels never cause unchecked rows to be removed.
+        """
+        if len(checked_obj) == len(full_obj):
+            return retained
+
+        checked_ids = get_row_ids(checked_obj)
+        retained_ids = get_row_ids(retained)
+        full_ids = get_row_ids(full_obj)
+        if checked_ids is None or retained_ids is None or full_ids is None:
+            dropped = checked_obj.index.difference(retained.index, sort=False)
+            if dropped.empty:
+                return full_obj
+            return full_obj[~full_obj.index.isin(dropped)]
+
+        kept = set(retained_ids.tolist())
+        dropped_ids = set(checked_ids.tolist()) - kept
+        mask = np.array(
+            [row_id not in dropped_ids for row_id in full_ids], dtype=bool
+        )
+        return take_rows(full_obj, mask)
 
     @validate_scope(scope=ValidationScope.DATA)
     def run_checks(
@@ -841,10 +948,11 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                     check=f"coerce_dtype('{schema.dtype}')",
                 ) from exc
 
-        def _try_coercion(coerce_fn, obj):
+        def _try_coercion(coerce_fn, obj, dtype=None):
             try:
                 return coerce_fn(obj)
             except SchemaError as exc:
+                self._record_coercion_failure_ids(obj, dtype, exc)
                 error_handler.collect_error(
                     get_error_category(SchemaErrorReason.DATATYPE_COERCION),
                     SchemaErrorReason.DATATYPE_COERCION,
@@ -873,7 +981,9 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                         _col_schema = copy.deepcopy(col_schema)
                         _col_schema.coerce = True
                         obj[matched_colname] = _try_coercion(
-                            _col_schema.coerce_dtype, obj[matched_colname]
+                            _col_schema.coerce_dtype,
+                            obj[matched_colname],
+                            _col_schema.dtype,
                         )
             elif (
                 (col_schema.coerce or schema.coerce)
@@ -886,11 +996,13 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                 _col_schema = copy.deepcopy(col_schema)
                 _col_schema.coerce = True
                 obj[colname] = _try_coercion(
-                    _col_schema.coerce_dtype, obj[colname]
+                    _col_schema.coerce_dtype,
+                    obj[colname],
+                    _col_schema.dtype,
                 )
 
         if schema.dtype is not None:
-            obj = _try_coercion(_coerce_df_dtype, obj)
+            obj = _try_coercion(_coerce_df_dtype, obj, schema.dtype)
         if (
             schema.index is not None
             and (schema.index.coerce or schema.coerce)
@@ -903,7 +1015,9 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                 # coercing at the dataframe-level should apply index coercion
                 # for both single- and multi-indexes.
                 index_schema.coerce = True
-            coerced_index = _try_coercion(index_schema.coerce_dtype, obj.index)
+            coerced_index = _try_coercion(
+                index_schema.coerce_dtype, obj.index, index_schema.dtype
+            )
             if coerced_index is not None:
                 obj.index = coerced_index
 

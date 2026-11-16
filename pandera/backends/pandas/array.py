@@ -2,6 +2,7 @@
 
 from typing import Optional, cast
 
+import numpy as np
 import pandas as pd
 
 from pandera.api.base.error_handler import ErrorHandler, get_error_category
@@ -10,6 +11,10 @@ from pandera.backends.base import CoreCheckResult, CoreParserResult
 from pandera.backends.pandas.base import (
     PandasSchemaBackend,
     _parsed_column_values,
+    attach_failing_ids,
+    ensure_row_ids,
+    get_row_ids,
+    strip_row_ids_on_exit,
 )
 from pandera.backends.pandas.error_formatters import (
     describe_dtype_mismatch,
@@ -26,6 +31,34 @@ from pandera.errors import (
     SchemaErrors,
 )
 from pandera.validation_depth import validate_scope, validation_type
+
+
+def _ids_for_mask(check_obj, mask):
+    """Positional row ids selected by ``mask`` over ``check_obj``."""
+    if mask is None:
+        return None
+    row_ids = get_row_ids(check_obj)
+    if row_ids is None:
+        return None
+    mask = np.asarray(mask)
+    if mask.dtype != bool:
+        mask = mask.astype(bool)
+    if len(mask) != len(check_obj):
+        return None
+    return row_ids[mask]
+
+
+def _dtype_failing_ids(check_obj, schema_dtype):
+    """Row ids whose values cannot be coerced to ``schema_dtype``."""
+    try:
+        from pandera.engines import utils as engine_utils
+
+        coercible = engine_utils.numpy_pandas_coercible(
+            check_obj, schema_dtype
+        )
+    except Exception:  # pragma: no cover - unexpected dtype handling
+        return None
+    return _ids_for_mask(check_obj, ~np.asarray(coercible).astype(bool))
 
 
 class ArraySchemaBackend(PandasSchemaBackend):
@@ -94,6 +127,7 @@ class ArraySchemaBackend(PandasSchemaBackend):
     def preprocess(self, check_obj, inplace: bool = False):
         return check_obj if inplace else check_obj.copy()
 
+    @strip_row_ids_on_exit
     def validate(
         self,
         check_obj,
@@ -108,6 +142,7 @@ class ArraySchemaBackend(PandasSchemaBackend):
     ):
         error_handler = ErrorHandler(lazy)
         check_obj = self.preprocess(check_obj, inplace)
+        ensure_row_ids(check_obj)
 
         if getattr(schema, "drop_invalid_rows", False) and not lazy:
             raise SchemaDefinitionError(
@@ -183,6 +218,7 @@ class ArraySchemaBackend(PandasSchemaBackend):
             if isinstance(results, CoreCheckResult):
                 results = [results]
             results = cast(list[CoreCheckResult], results)
+            checked_obj = args[0]
             for result in results:
                 if result.passed:
                     continue
@@ -200,12 +236,20 @@ class ArraySchemaBackend(PandasSchemaBackend):
                         check_output=result.check_output,
                         reason_code=result.reason_code,
                     )
-                    error_handler.collect_error(
-                        get_error_category(result.reason_code),
-                        result.reason_code,
-                        error,
-                        original_exc=result.original_exc,
-                    )
+                # Record which rows of the checked (possibly subsampled)
+                # object failed, so drop_invalid_rows removes exactly them.
+                error.failure_cases = attach_failing_ids(
+                    checked_obj,
+                    error.failure_cases,
+                    result.check_output,
+                    result.failing_ids,
+                )
+                error_handler.collect_error(
+                    get_error_category(result.reason_code),
+                    result.reason_code,
+                    error,
+                    original_exc=result.original_exc,
+                )
 
         return error_handler
 
@@ -351,6 +395,7 @@ class ArraySchemaBackend(PandasSchemaBackend):
                 f"null values:\n{check_obj[isna]}"
             ),
             failure_cases=failure_cases,
+            failing_ids=_ids_for_mask(check_obj, isna) if not passed else None,
         )
 
     @validate_scope(scope=ValidationScope.DATA)
@@ -397,6 +442,11 @@ class ArraySchemaBackend(PandasSchemaBackend):
             reason_code=SchemaErrorReason.SERIES_CONTAINS_DUPLICATES,
             message=message,
             failure_cases=failure_cases,
+            failing_ids=(
+                _ids_for_mask(check_obj, duplicates)
+                if not passed and duplicates is not None
+                else None
+            ),
         )
 
     @validate_scope(scope=ValidationScope.SCHEMA)
@@ -410,6 +460,7 @@ class ArraySchemaBackend(PandasSchemaBackend):
                 Engine.dtype(check_obj.dtype),
                 check_obj,
             )
+            dtype_failing_ids = None
             if isinstance(dtype_check_results, bool):
                 passed = dtype_check_results
                 # When whole-series dtype check fails, get element-level failure
@@ -463,6 +514,9 @@ class ArraySchemaBackend(PandasSchemaBackend):
                     expected_type, actual_type = describe_dtype_mismatch(
                         schema.dtype, check_obj.dtype
                     )
+                    dtype_failing_ids = _dtype_failing_ids(
+                        check_obj, schema.dtype
+                    )
                 else:
                     expected_type = str(schema.dtype)
                     actual_type = str(check_obj.dtype)
@@ -472,6 +526,9 @@ class ArraySchemaBackend(PandasSchemaBackend):
                 )
             else:
                 passed = dtype_check_results.all()
+                dtype_failing_ids = _ids_for_mask(
+                    check_obj, ~dtype_check_results.astype(bool)
+                )
                 failure_cases = reshape_failure_cases(
                     check_obj[~dtype_check_results.astype(bool)],
                     ignore_na=False,
@@ -480,6 +537,8 @@ class ArraySchemaBackend(PandasSchemaBackend):
                     f"expected series '{check_obj.name}' to have type "
                     f"{schema.dtype}:\nfailure cases:\n{failure_cases}"
                 )
+        else:
+            dtype_failing_ids = None
 
         return CoreCheckResult(
             passed=passed,
@@ -487,6 +546,7 @@ class ArraySchemaBackend(PandasSchemaBackend):
             reason_code=SchemaErrorReason.WRONG_DATATYPE,
             message=msg,
             failure_cases=failure_cases,
+            failing_ids=dtype_failing_ids,
         )
 
     @validate_scope(scope=ValidationScope.DATA)

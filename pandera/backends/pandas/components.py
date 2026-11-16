@@ -21,7 +21,10 @@ from pandera.backends.pandas.array import (
     ArraySchemaBackend,
     SeriesSchemaBackend,
 )
-from pandera.backends.pandas.base import PandasSchemaBackend
+from pandera.backends.pandas.base import (
+    PandasSchemaBackend,
+    strip_row_ids_on_exit,
+)
 from pandera.backends.pandas.error_formatters import reshape_failure_cases
 from pandera.engines.pandas_engine import Engine
 from pandera.errors import (
@@ -40,6 +43,7 @@ from pandera.validation_depth import (
 class ColumnBackend(ArraySchemaBackend):
     """Backend implementation for pandas dataframe columns."""
 
+    @strip_row_ids_on_exit
     def validate(
         self,
         check_obj: pd.DataFrame,

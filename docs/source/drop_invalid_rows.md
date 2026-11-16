@@ -22,8 +22,11 @@ remove the rows which causes the failure.
 This functionality is available on `DataFrameSchema`, `SeriesSchema`, `Column`,
 as well as `DataFrameModel` schemas.
 
-**Note** that this functionality works by identifying the index or multi-index of the failing rows.
-If the index is not unique on the dataframe, this could result in incorrect rows being dropped.
+**Note** that this functionality works by identifying the failing rows
+positionally. Index labels are preserved, so duplicate index labels (including
+repeated MultiIndex combinations) do not cause valid rows to be dropped or
+invalid rows to be kept. When ``head``, ``tail``, or ``sample`` is used, only
+the rows that were actually validated are subject to removal.
 
 Dropping invalid rows with {class}`~pandera.api.pandas.container.DataFrameSchema`:
 

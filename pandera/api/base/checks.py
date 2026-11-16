@@ -23,6 +23,10 @@ class CheckResult(NamedTuple):
     check_passed: Any
     checked_object: Any
     failure_cases: Any
+    # Internal: positional ids of the rows that failed this check (see
+    # ``PandasSchemaBackend.drop_invalid_rows``). ``None`` when the check
+    # cannot be attributed to individual rows.
+    failing_ids: Any = None
 
 
 _T = TypeVar("_T", bound="BaseCheck")

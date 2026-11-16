@@ -1,9 +1,11 @@
 """Check backend for pandas."""
 
+from collections import defaultdict
 from collections.abc import Hashable
 from functools import partial
 from typing import Optional, Union, cast
 
+import numpy as np
 import pandas as pd
 
 from pandera.api.base.checks import CheckResult
@@ -16,6 +18,18 @@ from pandera.api.pandas.types import (
     is_table_or_field,
 )
 from pandera.backends.base import BaseCheckBackend
+from pandera.backends.pandas.base import (
+    _read_row_ids,
+    _set_row_ids,
+    get_row_ids,
+)
+
+
+def _index_keys(index):
+    """Hashable key per index label (tuples for a MultiIndex)."""
+    if isinstance(index, pd.MultiIndex):
+        return [tuple(label) for label in index]
+    return list(index)
 
 
 class PandasCheckBackend(BaseCheckBackend):
@@ -235,9 +249,11 @@ class PandasCheckBackend(BaseCheckBackend):
                     .head(self.check.n_failure_cases)["failure_cases"]
                 )
             else:
-                failure_cases = failure_cases.groupby(check_output).head(
-                    self.check.n_failure_cases
-                )
+                # ``failure_cases`` only holds failing rows, so limiting the
+                # report is a positional truncation. Grouping by the aligned
+                # check output would try to realign on the index and fails
+                # when index labels repeat.
+                failure_cases = failure_cases.head(self.check.n_failure_cases)
         return failure_cases
 
     def postprocess_field(
@@ -360,6 +376,73 @@ class PandasCheckBackend(BaseCheckBackend):
         check_obj: Union[pd.Series, pd.DataFrame],
         key: str | None = None,
     ) -> CheckResult:
-        check_obj = self.preprocess(check_obj, key)
-        check_output = self.apply(check_obj)
-        return self.postprocess(check_obj, check_output)
+        # Remember each row's position before ``preprocess`` may drop rows
+        # (e.g. ``ignore_na``) so the check output can be attributed back to
+        # the exact rows of the validated object.
+        row_ids = get_row_ids(check_obj)
+        input_ids = (
+            row_ids
+            if row_ids is not None
+            else np.arange(len(check_obj), dtype=np.int64)
+        )
+        preprocessed = self.preprocess(check_obj, key)
+        if isinstance(preprocessed, (pd.Series, pd.DataFrame)):
+            preprocessed_ids = self._positions_for(
+                preprocessed, check_obj, input_ids
+            )
+            if preprocessed_ids is not None:
+                _set_row_ids(preprocessed, preprocessed_ids)
+        check_output = self.apply(preprocessed)
+        result = self.postprocess(preprocessed, check_output)
+        return result._replace(
+            failing_ids=self._failing_ids(preprocessed, result.check_output)
+        )
+
+    @staticmethod
+    def _positions_for(obj, source, source_ids):
+        """Positions in ``source`` for each row of ``obj``.
+
+        ``preprocess`` returns an ordered subsequence of the input, so labels
+        are matched occurrence by occurrence. That keeps repeated labels tied
+        to distinct positions instead of collapsing onto the first match.
+        """
+        if len(obj) == len(source):
+            return np.asarray(source_ids, dtype=np.int64)
+        try:
+            source_keys = _index_keys(source.index)
+            positions_by_label: dict = defaultdict(list)
+            for pos, key in enumerate(source_keys):
+                positions_by_label[key].append(pos)
+            seen: dict = defaultdict(int)
+            positions = []
+            for key in _index_keys(obj.index):
+                candidates = positions_by_label.get(key)
+                if not candidates:
+                    return None
+                seen[key] += 1
+                if seen[key] > len(candidates):
+                    return None
+                positions.append(candidates[seen[key] - 1])
+        except Exception:  # pragma: no cover - non-pandas objects
+            return None
+        return np.asarray(source_ids, dtype=np.int64)[np.asarray(positions)]
+
+    @staticmethod
+    def _failing_ids(check_obj, check_output):
+        """Ids of the rows that failed, when the output can be aligned."""
+        if not isinstance(check_obj, (pd.Series, pd.DataFrame)):
+            return None
+        if not isinstance(check_output, (pd.Series, pd.DataFrame)):
+            return None
+        try:
+            mask = ~np.asarray(check_output).astype(bool)
+        except (TypeError, ValueError):  # pragma: no cover - non-boolean
+            return None
+        if mask.ndim > 1:
+            mask = mask.any(axis=1)
+        if len(mask) != len(check_obj):
+            return None
+        ids = _read_row_ids(check_obj)
+        if ids is None or len(ids) != len(mask):
+            return None
+        return ids[mask]

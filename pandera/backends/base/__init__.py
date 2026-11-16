@@ -25,6 +25,8 @@ class CoreCheckResult(NamedTuple):
     failure_cases: Any | None = None
     schema_error: SchemaError | None = None
     original_exc: Exception | None = None
+    # Internal: positional ids of the rows that failed this core check.
+    failing_ids: Any | None = None
 
 
 class ColumnInfo(NamedTuple):
