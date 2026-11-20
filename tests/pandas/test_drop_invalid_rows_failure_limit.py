@@ -237,3 +237,246 @@ def test_drop_invalid_rows_failure_limit_respects_subsample(n_failure_cases):
     validated = schema.validate(frame, head=2, lazy=True)
 
     pd.testing.assert_frame_equal(validated, frame.iloc[2:])
+
+
+def _table_check_failure_cases(frame, n_failure_cases):
+    """Validate with a dataframe-level check and return its failure cases."""
+    schema = pa.DataFrameSchema(
+        checks=pa.Check(lambda df: df > 0, n_failure_cases=n_failure_cases)
+    )
+    try:
+        schema.validate(frame, lazy=True)
+    except pa.errors.SchemaErrors as exc:
+        return exc.failure_cases
+    raise AssertionError("expected the table-level check to fail")
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, 2, None])
+@pytest.mark.parametrize(
+    "index",
+    [
+        pd.RangeIndex(3),
+        pd.Index([10, 20, 30]),
+        pd.Index(["a", "b", "c"]),
+        pd.Index(["a", "b", "c"], name="row"),
+        pd.date_range("2026-01-01", periods=3),
+    ],
+)
+def test_table_check_failure_limit_preserves_labels(n_failure_cases, index):
+    """A table-level report limit keeps each row's original labels and values."""
+    frame = pd.DataFrame(
+        {"x": [-1.0, 2.0, -3.0], "y": [4.0, -5.0, 6.0]}, index=index
+    )
+
+    failure_cases = _table_check_failure_cases(frame, n_failure_cases)
+
+    expected_labels = {
+        None: [index[0], index[1], index[2]],
+        0: [],
+        1: [index[0]],
+        2: [index[0], index[1]],
+    }[n_failure_cases]
+    expected_values = {
+        None: [{"x": -1.0}, {"y": -5.0}, {"x": -3.0}],
+        0: [],
+        1: [{"x": -1.0}],
+        2: [{"x": -1.0}, {"y": -5.0}],
+    }[n_failure_cases]
+    assert list(failure_cases["index"]) == expected_labels
+    assert list(failure_cases["failure_case"]) == expected_values
+    assert failure_cases["index"].dtype == frame.index.dtype
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, 2, None])
+def test_table_check_failure_limit_matches_full_report_prefix(
+    n_failure_cases,
+):
+    """Capping the report only removes trailing rows from the full report."""
+    frame = pd.DataFrame(
+        {"x": [-1.0, 2.0, -3.0], "y": [4.0, -5.0, 6.0]},
+        index=["a", "b", "c"],
+    )
+
+    full = _table_check_failure_cases(frame, None)
+    limited = _table_check_failure_cases(frame, n_failure_cases)
+
+    if n_failure_cases is None:
+        pd.testing.assert_frame_equal(limited, full)
+    else:
+        # An empty capped report keeps the legacy empty-report dtype.
+        reference = full.head(n_failure_cases)
+        assert list(limited["index"]) == list(reference["index"])
+        assert list(limited["failure_case"]) == list(reference["failure_case"])
+
+
+@pytest.mark.parametrize("n_failure_cases", [1, 2, None])
+def test_table_check_failure_limit_merges_duplicate_row_labels(
+    n_failure_cases,
+):
+    """Rows sharing a label keep reporting the same merged payload."""
+    frame = pd.DataFrame(
+        {"x": [-1.0, 2.0, -3.0], "y": [4.0, -5.0, 6.0]},
+        index=pd.Index([3, 3, 4], name="row"),
+    )
+
+    failure_cases = _table_check_failure_cases(frame, n_failure_cases)
+
+    if n_failure_cases is None:
+        assert list(failure_cases["index"]) == [3, 4]
+        assert list(failure_cases["failure_case"]) == [
+            {"x": -1.0, "y": -5.0},
+            {"x": -3.0},
+        ]
+    else:
+        assert list(failure_cases["index"]) == [3, 4][:n_failure_cases]
+        assert (
+            list(failure_cases["failure_case"])
+            == [
+                {"x": -1.0, "y": -5.0},
+                {"x": -3.0},
+            ][:n_failure_cases]
+        )
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, 2, None])
+def test_table_check_failure_limit_handles_nulls_and_partial_failures(
+    n_failure_cases,
+):
+    """Null cells are skipped and only failing rows are reported."""
+    frame = pd.DataFrame(
+        {
+            "x": [-1.0, None, -3.0, 4.0],
+            "y": [5.0, -6.0, None, 8.0],
+        },
+        index=pd.Index([1.0, 2.0, 3.0, 4.0]),
+    )
+
+    failure_cases = _table_check_failure_cases(frame, n_failure_cases)
+
+    expected = (
+        [1.0, 2.0, 3.0]
+        if n_failure_cases is None
+        else [
+            1.0,
+            2.0,
+            3.0,
+        ][:n_failure_cases]
+    )
+    assert list(failure_cases["index"]) == expected
+    assert (
+        list(failure_cases["failure_case"])
+        == [
+            {"x": -1.0},
+            {"y": -6.0},
+            {"x": -3.0},
+        ][: len(expected)]
+    )
+
+
+@pytest.mark.parametrize("n_failure_cases", [1, 2, 3, None])
+def test_table_check_failure_limit_deduplicates_reports(n_failure_cases):
+    """Duplicate payloads are reported once, before the cap is applied."""
+    frame = pd.DataFrame(
+        {"x": [-1.0, 2.0, -1.0], "y": [3.0, -4.0, 3.0]},
+        index=["a", "b", "c"],
+    )
+
+    failure_cases = _table_check_failure_cases(frame, n_failure_cases)
+
+    if n_failure_cases is None:
+        # Without a cap the report keeps every failing row.
+        assert list(failure_cases["index"]) == ["a", "b", "c"]
+        assert list(failure_cases["failure_case"]) == [
+            {"x": -1.0},
+            {"y": -4.0},
+            {"x": -1.0},
+        ]
+    else:
+        expected = [{"x": -1.0}, {"y": -4.0}][:n_failure_cases]
+        assert list(failure_cases["failure_case"]) == expected
+
+
+def test_table_check_failure_limit_zero_returns_empty_report():
+    """A zero cap returns the same empty report shape as before."""
+    frame = pd.DataFrame({"x": [-1.0, 2.0], "y": [3.0, -4.0]})
+
+    failure_cases = _table_check_failure_cases(frame, 0)
+
+    assert list(failure_cases.columns) == [
+        "schema_context",
+        "column",
+        "check",
+        "check_number",
+        "failure_case",
+        "index",
+    ]
+    assert failure_cases.empty
+    assert failure_cases["index"].dtype == frame.index.dtype
+
+
+def test_table_check_failure_limit_does_not_change_pass_result():
+    """The table-level pass result still reflects every cell, not the cap."""
+    frame = pd.DataFrame({"x": [-1.0, 2.0], "y": [3.0, -4.0]})
+    schema = pa.DataFrameSchema(
+        checks=pa.Check(lambda df: df > 0, n_failure_cases=1)
+    )
+
+    with pytest.raises(pa.errors.SchemaErrors):
+        schema.validate(frame, lazy=True)
+
+    # The cap does not affect whether the schema passes: an all-passing frame
+    # validates regardless of how many failure cases would have been reported.
+    passing = pd.DataFrame({"x": [1.0, 2.0], "y": [3.0, 4.0]})
+    pd.testing.assert_frame_equal(schema.validate(passing, lazy=True), passing)
+
+
+def _table_check_peak_bytes(limit, n_rows=5000, n_cols=8):
+    """Peak tracked allocations while validating with a table-level check."""
+    import gc
+    import tracemalloc
+
+    frame = pd.DataFrame({f"c{col}": [-1.0] * n_rows for col in range(n_cols)})
+    schema = pa.DataFrameSchema(
+        checks=pa.Check(lambda df: df > 0, n_failure_cases=limit)
+    )
+    gc.collect()
+    tracemalloc.start()
+    before = tracemalloc.get_traced_memory()[0]
+    try:
+        schema.validate(frame, lazy=True)
+    except pa.errors.SchemaErrors:
+        pass
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return peak - before
+
+
+def test_table_check_failure_limit_allocates_less_than_full_report():
+    """A one-row report does not build the full report before truncating it."""
+    limited = _table_check_peak_bytes(1)
+    full = _table_check_peak_bytes(None)
+
+    # The one-row report skips the per-cell intermediates for every failing
+    # cell, so it allocates markedly less than the full report.
+    assert limited < full
+
+
+@pytest.mark.parametrize("n_failure_cases", [0, 1, None])
+def test_table_check_failure_limit_still_drops_all_invalid_rows(
+    n_failure_cases,
+):
+    """A capped table-level report still removes every failing row."""
+    frame = pd.DataFrame(
+        {"x": [-1.0, 2.0, -3.0, 4.0], "y": [5.0, -6.0, -7.0, 8.0]},
+        index=pd.Index(["a", "b", "c", "d"], name="row"),
+    )
+    schema = pa.DataFrameSchema(
+        checks=pa.Check(lambda df: df > 0, n_failure_cases=n_failure_cases),
+        drop_invalid_rows=True,
+    )
+
+    validated = schema.validate(frame, lazy=True)
+
+    pd.testing.assert_frame_equal(validated, frame.iloc[[3]])
+    # The input frame is not mutated by the row drop.
+    assert list(frame.index) == ["a", "b", "c", "d"]

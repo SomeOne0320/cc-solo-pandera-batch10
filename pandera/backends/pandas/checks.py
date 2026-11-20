@@ -4,6 +4,7 @@ from collections.abc import Hashable
 from functools import partial
 from typing import Optional, Union, cast
 
+import numpy as np
 import pandas as pd
 
 from pandera.api.base.checks import CheckResult
@@ -289,6 +290,58 @@ class PandasCheckBackend(BaseCheckBackend):
         if check_obj.index.equals(check_output.index) and self.check.ignore_na:
             check_output = check_output | check_obj.isna()
 
+        return CheckResult(
+            check_output,
+            check_output.all(axis=None),  # type: ignore
+            check_obj,
+            self._table_failure_cases(check_obj, check_output),
+        )
+
+    @staticmethod
+    def _can_scan_table_failure_cases(check_obj, check_output) -> bool:
+        """Whether failure cases can be built without a full report.
+
+        The scanning path walks the per-cell failure mask directly, which is
+        only equivalent to the reporting path when both frames are aligned
+        and boolean. Malformed check outputs (misaligned axes, non-boolean
+        outputs, duplicate column labels, MultiIndex rows) and the pandas-like
+        backends (modin, pyspark.pandas) keep using the reporting path so its
+        existing behavior is preserved.
+        """
+        if not check_obj.columns.is_unique:
+            return False
+        if isinstance(check_obj.index, pd.MultiIndex):
+            return False
+        if not check_obj.index.equals(check_output.index):
+            return False
+        if not check_obj.columns.equals(check_output.columns):
+            return False
+        if any(dtype != bool for dtype in check_output.dtypes):
+            return False
+        # Only native pandas frames are scanned: subclasses and the
+        # pandas-like backends (modin, pyspark.pandas, geopandas) keep the
+        # reporting path so their behavior is untouched.
+        return type(check_obj) is pd.DataFrame and (
+            type(check_output) is pd.DataFrame
+        )
+
+    def _table_failure_cases(self, check_obj, check_output) -> pd.DataFrame:
+        """Build the table-level failure-case report.
+
+        When the check output is aligned and boolean, failures are read
+        straight from the per-cell mask so that only the reported rows are
+        materialized: intermediate per-column frames for every failing cell
+        are never built, and with a ``n_failure_cases`` limit the scan stops
+        as soon as enough unique failure cases are collected.
+        """
+        if self._can_scan_table_failure_cases(check_obj, check_output):
+            return self._scan_table_failure_cases(check_obj, check_output)
+        return self._build_table_failure_cases(check_obj, check_output)
+
+    def _build_table_failure_cases(
+        self, check_obj, check_output
+    ) -> pd.DataFrame:
+        """Build the full failure-case report before limiting it."""
         # collect failure cases across all columns. False values in check_output
         # are nulls.
         select_failure_cases = check_obj[~check_output]
@@ -321,12 +374,234 @@ class PandasCheckBackend(BaseCheckBackend):
             failure_cases = failure_cases.drop_duplicates().head(
                 self.check.n_failure_cases
             )
-        return CheckResult(
-            check_output,
-            check_output.all(axis=None),  # type: ignore
-            check_obj,
-            failure_cases,
+        return failure_cases
+
+    @staticmethod
+    def _masked_column_dtype(series: pd.Series, masked) -> object:
+        """Dtype of ``series`` after masking out non-failing cells."""
+        if masked.all() or len(series) == 0:
+            return series.dtype
+        return (
+            series.iloc[:1]
+            .where(pd.Series([False], index=series.index[:1]))
+            .dtype
         )
+
+    @staticmethod
+    def _failure_case_index(labels, index: pd.Index) -> pd.Index:
+        """Rebuild the report index with the original labels and dtype."""
+        if isinstance(index, pd.CategoricalIndex):
+            return pd.CategoricalIndex(
+                labels,
+                categories=index.categories,
+                ordered=index.ordered,
+                name="index",
+            )
+        return pd.Index(labels, dtype=index.dtype, name="index")
+
+    @staticmethod
+    def _failure_case_frame(labels, payloads, index: pd.Index) -> pd.DataFrame:
+        values = np.empty(len(payloads), dtype=object)
+        for position, payload in enumerate(payloads):
+            values[position] = payload
+        result_index = PandasCheckBackend._failure_case_index(labels, index)
+        return pd.DataFrame(
+            {
+                "failure_case": pd.Series(
+                    values, index=result_index, dtype=object
+                )
+            }
+        )
+
+    def _scan_table_failure_cases(
+        self, check_obj, check_output
+    ) -> pd.DataFrame:
+        """Read failure cases from the mask, materializing only reported rows."""
+        index = check_obj.index
+        failure_masks: dict[object, np.ndarray] = {}
+        column_series: dict[object, pd.Series] = {}
+        masked_dtypes: dict[object, object] = {}
+        row_has_failure = np.zeros(len(check_obj), dtype=bool)
+
+        for col in check_obj.columns:
+            series = check_obj[col]
+            masked = ~check_output[col].to_numpy()
+            failures = masked & series.notna().to_numpy()
+            if not failures.any():
+                continue
+            failure_masks[col] = failures
+            column_series[col] = series
+            masked_dtypes[col] = self._masked_column_dtype(series, masked)
+            row_has_failure |= failures
+
+        if not failure_masks:
+            return pd.DataFrame(columns=["index", "failure_case"])
+
+        # The per-column values share one dtype in the report, exactly as the
+        # concatenated failure-case frame does in ``_build_table_failure_cases``.
+        common_dtype = pd.concat(
+            [pd.Series([], dtype=masked_dtypes[col]) for col in failure_masks]
+        ).dtype
+
+        positions = np.flatnonzero(row_has_failure)
+        labels_index = check_obj.index.take(positions)
+        if labels_index.isna().all():
+            # ``groupby`` drops NA labels, so no group is ever reported. The
+            # empty report keeps the concatenated dtype, as before.
+            return pd.DataFrame(
+                {
+                    "failure_case": pd.Series([], dtype=common_dtype),
+                },
+                index=self._failure_case_index([], check_obj.index),
+            )
+        grouper = pd.Series(positions, index=labels_index)
+        n_failure_cases = self.check.n_failure_cases
+        scanners = (
+            failure_masks,
+            column_series,
+            masked_dtypes,
+            common_dtype,
+        )
+
+        if n_failure_cases is None:
+            # No limit: every failing row is reported, without deduplication.
+            labels, payloads = self._collect_failure_cases(grouper, *scanners)
+        elif n_failure_cases < 0:
+            # ``head`` with a negative limit drops the tail of the deduplicated
+            # report, so the full set of unique cases has to be known first.
+            labels, payloads = self._collect_failure_cases(
+                grouper, *scanners, unique=True
+            )
+            labels = labels[:n_failure_cases]
+            payloads = payloads[:n_failure_cases]
+        else:
+            labels, payloads = self._collect_failure_cases(
+                grouper, *scanners, unique=True, limit=n_failure_cases
+            )
+        return self._failure_case_frame(labels, payloads, check_obj.index)
+
+    # Rows are scanned and de-duplicated in bounded batches so that a small
+    # ``n_failure_cases`` never materializes a report for every failing cell.
+    _FAILURE_CASE_CHUNK_SIZE = 512
+
+    def _collect_failure_cases(
+        self,
+        grouper,
+        failure_masks,
+        column_series,
+        masked_dtypes,
+        common_dtype,
+        unique: bool = False,
+        limit: int | None = None,
+    ) -> tuple[list, list[dict]]:
+        """Reported failure cases, one dictionary per row label.
+
+        With ``unique``, payloads are de-duplicated exactly as
+        ``drop_duplicates`` would, in bounded batches. Once ``limit`` unique
+        cases are known the scan stops, so rows past the report cap never
+        become payloads.
+        """
+        labels: list = []
+        payloads: list[dict] = []
+        chunk_labels: list = []
+        chunk_values: list[dict] = []
+        chunk_size = self._FAILURE_CASE_CHUNK_SIZE
+        done = False
+
+        for label, group in grouper.groupby(level=0, sort=True, dropna=True):
+            pos = group.to_numpy()
+            values = {}
+            for col, failures in failure_masks.items():
+                row_positions = pos[failures[pos]]
+                if row_positions.size:
+                    values[col] = column_series[col].iat[
+                        int(row_positions[-1])
+                    ]
+            chunk_labels.append(label)
+            chunk_values.append(values)
+            if len(chunk_labels) >= chunk_size:
+                labels, payloads, done = self._merge_failure_cases(
+                    labels,
+                    payloads,
+                    chunk_labels,
+                    chunk_values,
+                    masked_dtypes,
+                    common_dtype,
+                    unique,
+                    limit,
+                )
+                chunk_labels, chunk_values = [], []
+                if done:
+                    break
+        if not done and chunk_values:
+            labels, payloads, done = self._merge_failure_cases(
+                labels,
+                payloads,
+                chunk_labels,
+                chunk_values,
+                masked_dtypes,
+                common_dtype,
+                unique,
+                limit,
+            )
+        if limit is not None:
+            labels, payloads = labels[:limit], payloads[:limit]
+        return labels, payloads
+
+    def _merge_failure_cases(
+        self,
+        labels: list,
+        payloads: list[dict],
+        chunk_labels: list,
+        chunk_values: list[dict],
+        masked_dtypes,
+        common_dtype,
+        unique: bool,
+        limit: int | None,
+    ) -> tuple[list, list[dict], bool]:
+        """Box and merge one batch, keeping only the required unique cases."""
+        boxed = self._box_failure_cases(
+            chunk_values, masked_dtypes, common_dtype
+        )
+        labels = labels + chunk_labels
+        payloads = payloads + boxed
+        if unique:
+            keep = ~pd.Series(payloads, dtype=object).duplicated()
+            labels = [
+                label for label, keep_row in zip(labels, keep) if keep_row
+            ]
+            payloads = [
+                payload
+                for payload, keep_row in zip(payloads, keep)
+                if keep_row
+            ]
+        done = limit is not None and len(payloads) >= limit
+        if done:
+            labels, payloads = labels[:limit], payloads[:limit]
+        return labels, payloads, done
+
+    @staticmethod
+    def _box_failure_cases(
+        chunk_values, masked_dtypes, common_dtype
+    ) -> list[dict]:
+        """Box each raw failure value the way ``Series.to_dict`` would."""
+        payloads: list[dict] = [{} for _ in chunk_values]
+        for col, masked_dtype in masked_dtypes.items():
+            entries = [
+                (row, values[col])
+                for row, values in enumerate(chunk_values)
+                if col in values
+            ]
+            if not entries:
+                continue
+            boxed = (
+                pd.Series([value for _, value in entries], dtype=masked_dtype)
+                .astype(common_dtype)
+                .to_dict()
+            )
+            for offset, (row, _) in enumerate(entries):
+                payloads[row][col] = boxed[offset]
+        return payloads
 
     def postprocess_table_or_field_with_bool_output(
         self,
